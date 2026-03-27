@@ -1,0 +1,122 @@
+library(data.table)
+library(mgcv)
+library(ggplot2)
+library(gridExtra)
+
+mlb_23_raw <- fread("MLB_Statcast_2023.csv", na.strings = c("", "NA", "null"))
+mlb_24_raw <- fread("MLB_Statcast_2024.csv", na.strings = c("", "NA", "null"))
+mlb_25_raw <- fread("MLB_Statcast_2025.csv", na.strings = c("", "NA", "null"))
+
+fg_2024             <- fread("fg_2024_all.csv")
+expected_stats_2024 <- fread("expected_stats.csv")
+fg_2025             <- fread("fg_2025.csv")
+expected_stats_2025 <- fread("expected_stats_2025.csv")
+
+prep_base_data <- function(df, year_label) {
+  d <- copy(df)
+  
+  d[, game_date := as.character(game_date)]
+  
+  num_cols <- c("release_speed", "pfx_z", "pfx_x", "plate_x", "plate_z",
+                "vx0", "vy0", "vz0", "ax", "ay", "az", "release_pos_x", 
+                "release_pos_z", "release_extension", "delta_run_exp")
+  
+  d[, (num_cols) := lapply(.SD, as.numeric), .SDcols = num_cols]
+  
+  cols <- c(num_cols, "p_throws", "pitch_type", "pitcher", "balls", "strikes")
+  d <- d[complete.cases(d[, ..cols])]
+  
+  d[, pfx_x := pfx_x * 12]
+  d[, pfx_z := pfx_z * 12]
+  d[, flight_time := (1.4167 - 50) / vy0]
+  d[, vaa := atan((vz0 + (az * flight_time)) / -(vy0 + (ay * flight_time))) * (180 / pi)]
+  d[, haa := atan((vx0 + (ax * flight_time)) / -(vy0 + (ay * flight_time))) * (180 / pi)]
+  
+  d[, pfx_x_sym   := ifelse(p_throws == "L", pfx_x * -1, pfx_x)]
+  d[, haa_sym     := ifelse(p_throws == "L", haa * -1, haa)]
+  d[, plate_x_sym := ifelse(p_throws == "L", plate_x * -1, plate_x)]
+  d[, rel_x_sym   := ifelse(p_throws == "L", release_pos_x * -1, release_pos_x)]
+  
+  d[, pitch_type := as.factor(pitch_type)]
+  d[, p_throws   := as.factor(p_throws)]
+  d[, game_year  := year_label]
+  return(d)
+}
+
+prep_targets <- function(fg, exp) {
+  f <- copy(fg)
+  
+  stuff_col <- grep("Stuff", names(f), ignore.case = TRUE, value = TRUE)[1]
+  
+  if (!is.na(stuff_col)) {
+    f[, FG_Stuff_Plus := as.numeric(get(stuff_col))]
+  } else {
+    f[, FG_Stuff_Plus := NA_real_]
+  }
+  
+  f[, xMLBAMID := as.numeric(xMLBAMID)]
+  if("K_pct" %in% names(f)) f[, K_pct := as.numeric(gsub("%", "", K_pct))]
+  if("SwStr_pct" %in% names(f)) f[, SwStr_pct := as.numeric(gsub("%", "", SwStr_pct))]
+  
+  e <- copy(exp)[, player_id := as.numeric(player_id)]
+  
+  return(merge(f, e, by.x="xMLBAMID", by.y="player_id", all.x = TRUE))
+}
+
+mlb_train <- rbind(prep_base_data(mlb_23_raw, 2023), prep_base_data(mlb_24_raw, 2024))
+mlb_25_base <- prep_base_data(mlb_25_raw, 2025)
+
+train_means <- mlb_train[, .(base_ivb = mean(pfx_z), base_hb = mean(pfx_x_sym)), by = pitch_type]
+vaa_anchor  <- lm(vaa ~ release_speed + plate_z, data = mlb_train)
+haa_anchor  <- lm(haa_sym ~ release_speed + plate_x_sym, data = mlb_train)
+
+mlb_train <- merge(mlb_train, train_means, by = "pitch_type")
+mlb_train[, `:=`(ivb_diff = pfx_z - base_ivb, hb_diff_sym = pfx_x_sym - base_hb,
+                 vaa_resid = vaa - predict(vaa_anchor, newdata = mlb_train),
+                 haa_resid_sym = haa_sym - predict(haa_anchor, newdata = mlb_train))]
+
+mlb_train[, stuff_resid_sym := resid(lm(as.numeric(delta_run_exp) ~ 
+                                          as.factor(balls) + as.factor(strikes) + 
+                                          plate_x_sym + plate_z, data = mlb_train))]
+
+shape_plus_v2 <- bam(stuff_resid_sym ~
+                      s(release_speed) + s(pfx_z) + s(pfx_x_sym) +
+                      s(release_pos_z) + s(rel_x_sym) + s(release_extension) +
+                      s(vaa_resid) + s(haa_resid_sym) +
+                      s(ivb_diff) + s(hb_diff_sym) +
+                      p_throws + ti(release_speed, pfx_z) + ti(release_speed, vaa_resid) +
+                      s(pitch_type, bs="re"),
+                    data = mlb_train, discrete = TRUE, nthreads = 4)
+
+t_preds <- predict(shape_plus_v2, newdata = mlb_train)
+mu_l6 <- mean(t_preds); sig_l6 <- sd(t_preds)
+
+mlb_24_processed <- mlb_train[game_year == 2024]
+mlb_24_processed[, Shape_Plus := (((predict(shape_plus_v2, newdata = mlb_24_processed) * -1) - mu_l6) / sig_l6) * 10 + 100]
+
+mlb_25_safe <- merge(mlb_25_base, train_means, by = "pitch_type")
+mlb_25_safe[, `:=`(ivb_diff = pfx_z - base_ivb, hb_diff_sym = pfx_x_sym - base_hb,
+                   vaa_resid = vaa - predict(vaa_anchor, newdata = mlb_25_safe),
+                   haa_resid_sym = haa_sym - predict(haa_anchor, newdata = mlb_25_safe))]
+raw_25_pred <- predict(shape_plus_v2, newdata = mlb_25_safe)
+mlb_25_safe[, Shape_Plus := (((raw_25_pred * -1) - mu_l6) / sig_l6) * 10 + 100]
+
+summ_24 <- mlb_24_processed[, .(Shape_Plus_IS = mean(Shape_Plus), Pitches_IS = .N), by=pitcher][Pitches_IS > 400]
+summ_25 <- mlb_25_safe[, .(Shape_Plus_OOS = mean(Shape_Plus), Pitches_OOS = .N), by=pitcher][Pitches_OOS > 400]
+
+val_24 <- merge(summ_24, prep_targets(fg_2024, expected_stats_2024), by.x="pitcher", by.y="xMLBAMID")
+# ... [Your existing code ends with the val_24 merge] ...
+
+val_25 <- merge(summ_25, prep_targets(fg_2025, expected_stats_2025), by.x="pitcher", by.y="xMLBAMID")
+
+# 1. Save the actual model object to your folder
+saveRDS(shape_plus_v2, "shape_plus_v2_model.rds")
+
+# 2. Save the scaling constants (You need these to score new pitches later)
+scaling_constants <- list(mu = mu_l6, sig = sig_l6)
+saveRDS(scaling_constants, "shape_plus_scaling.rds")
+
+# 3. Export the final datasets as CSVs
+fwrite(mlb_25_safe, "scored_pitches_2025.csv")
+fwrite(val_24, "pitcher_leaderboard_2024.csv")
+fwrite(val_25, "pitcher_leaderboard_2025.csv")
