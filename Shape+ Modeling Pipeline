@@ -109,14 +109,12 @@ val_24 <- merge(summ_24, prep_targets(fg_2024, expected_stats_2024), by.x="pitch
 
 val_25 <- merge(summ_25, prep_targets(fg_2025, expected_stats_2025), by.x="pitcher", by.y="xMLBAMID")
 
-# 1. Save the actual model object to your folder
+
 saveRDS(shape_plus_v2, "shape_plus_v2_model.rds")
 
-# 2. Save the scaling constants (You need these to score new pitches later)
 scaling_constants <- list(mu = mu_l6, sig = sig_l6)
 saveRDS(scaling_constants, "shape_plus_scaling.rds")
 
-# 3. Export the final datasets as CSVs
 fwrite(mlb_25_safe, "scored_pitches_2025.csv")
 fwrite(val_24, "pitcher_leaderboard_2024.csv")
 fwrite(val_25, "pitcher_leaderboard_2025.csv")
